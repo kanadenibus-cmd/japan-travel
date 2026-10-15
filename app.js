@@ -276,21 +276,59 @@ const els = {
 };
 
 /* ---------- 지도 ---------- */
-const map = L.map('map', { zoomControl: false, worldCopyJump: true })
+const map = L.map('map', { zoomControl: false, worldCopyJump: true, minZoom: 2, maxZoom: 19 })
   .setView(JAPAN_VIEW.center, JAPAN_VIEW.zoom);
 map.attributionControl.setPrefix('<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');
 L.control.zoom({ position: 'bottomright', zoomInTitle: '확대', zoomOutTitle: '축소' }).addTo(map);
 
-// 모두 API 키 없이 쓸 수 있는 지도 (오른쪽 위 버튼으로 바꿀 수 있음)
+// 모두 API 키·가입·결제 없이 쓸 수 있는 지도 (오른쪽 위 버튼으로 바꿀 수 있음)
 const GSI_ATTR = '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">国土地理院</a>';
-const BASE_LAYERS = {
+const OFM_ATTR = '<a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> '
+  + '&copy; <a href="https://www.openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> '
+  + 'Data from <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
+
+// 지명은 한국어 이름이 있으면 한국어로, 없으면 현지 이름으로
+const KO_LABEL = ['coalesce', ['get', 'name:ko'], ['get', 'name']];
+function useKoreanLabels(gl) {
+  for (const l of gl.getStyle().layers) {
+    if (l.type !== 'symbol') continue;
+    const tf = gl.getLayoutProperty(l.id, 'text-field');
+    if (tf && JSON.stringify(tf).includes('name')) gl.setLayoutProperty(l.id, 'text-field', KO_LABEL);
+  }
+}
+
+// 구글 지도처럼 철도·역·공원·도시가 보이는 무료 벡터 지도 (OpenFreeMap)
+function vectorBaseLayer() {
+  const canGL = !!(L.maplibreGL && window.maplibregl
+    && (document.createElement('canvas').getContext('webgl2') || document.createElement('canvas').getContext('webgl')));
+  if (!canGL) return null;
+  const layer = L.maplibreGL({
+    style: 'https://tiles.openfreemap.org/styles/liberty',
+    localIdeographFontFamily: "'Noto Sans KR', 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif",
+  });
+  // 출처 표시는 필수: 지도 스타일을 불러오는 시점과 상관없이 항상 같은 문구가 붙도록 고정
+  layer.getAttribution = () => OFM_ATTR;
+  layer.on('add', () => {
+    const gl = layer.getMaplibreMap();
+    if (!gl || gl.__koLabels) return;
+    gl.__koLabels = true;
+    if (gl.isStyleLoaded()) useKoreanLabels(gl);
+    gl.on('style.load', () => useKoreanLabels(gl));
+  });
+  return layer;
+}
+
+const BASE_LAYERS = {};
+const vectorLayer = vectorBaseLayer();
+if (vectorLayer) BASE_LAYERS['기본 지도'] = vectorLayer;
+Object.assign(BASE_LAYERS, {
   '연한 지도 (일본 지리원)': L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png', {
     maxZoom: 19, maxNativeZoom: 18, attribution: GSI_ATTR,
   }),
   '표준 지도 (일본 지리원)': L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', {
     maxZoom: 19, maxNativeZoom: 18, attribution: GSI_ATTR,
   }),
-};
+});
 // OpenStreetMap 타일은 웹 주소(http)로 열었을 때만 쓸 수 있음 — 파일을 바로 열면 차단됨
 if (location.protocol.startsWith('http')) {
   BASE_LAYERS['상세 지도 (OpenStreetMap)'] = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -299,8 +337,26 @@ if (location.protocol.startsWith('http')) {
   });
 }
 (BASE_LAYERS[state.settings.baseLayer] || Object.values(BASE_LAYERS)[0]).addTo(map);
-L.control.layers(BASE_LAYERS, null, { position: 'topright' }).addTo(map);
+
+// 산의 높낮이를 그림자로 살짝 얹음 (일본 지리원 음영 지도, 일본만 해당). 바탕 지도 위·핀 아래
+map.createPane('relief');
+map.getPane('relief').style.zIndex = 250;
+map.getPane('relief').style.pointerEvents = 'none';
+map.getPane('relief').style.mixBlendMode = 'multiply'; // 바탕 지도 색을 살리고 그림자만 더함
+const RELIEF_NAME = '산 음영 (일본)';
+const reliefLayer = L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/hillshademap/{z}/{x}/{y}.png', {
+  // 시내까지 확대하면 평지가 회색으로 탁해져서 넓게 볼 때(14단계까지)만 보여 줌
+  pane: 'relief', minZoom: 2, maxZoom: 14, opacity: 0.3, attribution: GSI_ATTR,
+});
+if (state.settings.relief !== false) reliefLayer.addTo(map);
+
+L.control.layers(BASE_LAYERS, { [RELIEF_NAME]: reliefLayer }, { position: 'topright' }).addTo(map);
 map.on('baselayerchange', e => { state.settings.baseLayer = e.name; saveSettings(); });
+map.on('overlayadd overlayremove', e => {
+  if (e.name !== RELIEF_NAME) return;
+  state.settings.relief = e.type === 'overlayadd';
+  saveSettings();
+});
 
 const markerLayer = L.layerGroup().addTo(map);
 const markers = new Map();

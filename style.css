@@ -660,7 +660,7 @@ dialog.sheet::backdrop { background: rgba(32, 27, 22, .45); }
 
   .quick-add { top: 10px; left: 10px; width: calc(100% - 20px - 50px); }
   .quick-hint { font-size: 11.5px; }
-  .legend { left: 10px; bottom: 26px; }
+  .legend { left: 10px; bottom: 46px; } /* 두 줄로 접히는 지도 출처 표시 위로 */
   .pick-banner { top: 10px; }
 }
 
