@@ -101,6 +101,11 @@
         <section class="group">
           <h3>기본 정보</h3>
           <label class="field"><span>장소 이름 <em>*</em></span><input name="name" maxlength="100" placeholder="예: 후시미 이나리 타이샤"></label>
+          <div class="enrich-bar">
+            <a class="btn small gmaps-btn" id="gmaps-search" href="https://www.google.com/maps" target="_blank" rel="noopener">구글 지도에서 찾기 ↗</a>
+            <button type="button" class="btn small ghost" id="btn-enrich">✨ 무료 자료로 빈 칸 채우기</button>
+            <small class="hint" id="enrich-status"></small>
+          </div>
           <div class="row">
             <label class="field"><span>카테고리</span><select name="category"></select></label>
             <label class="field"><span>지역</span><input name="region" list="region-list" placeholder="예: 교토부"></label>
@@ -119,6 +124,19 @@
           </div>
           <label class="field"><span>구글 지도 링크</span><input name="googleUrl" type="url" inputmode="url" placeholder="https://www.google.com/maps/place/…"><small class="hint" id="gurl-hint"></small></label>
           <label class="field"><span>주소</span><input name="address" placeholder="위치를 정하면 자동으로 채워져요"></label>
+          <input type="hidden" name="photoUrl"><input type="hidden" name="photoPage"><input type="hidden" name="infoDate">
+          <label class="field"><span>소개</span><textarea name="summary" rows="3" placeholder="자동으로 채워지거나 직접 입력"></textarea></label>
+          <div class="row">
+            <label class="field"><span>영업시간</span><input name="hours" placeholder="예: 매일 07:00–18:00"></label>
+            <label class="field"><span>홈페이지</span><input name="website" type="url" inputmode="url" placeholder="https://…"></label>
+          </div>
+        </section>
+
+        <section class="group" id="photo-section">
+          <h3>사진</h3>
+          <div class="photo-grid" id="photo-grid"></div>
+          <input type="file" id="photo-input" accept="image/*" multiple hidden>
+          <small class="hint" id="photo-hint"></small>
         </section>
 
         <section class="group" id="visited-section" hidden>
@@ -250,6 +268,15 @@
         </section>
       </div>
     </div>
+  </dialog>
+
+  <!-- 사진 크게 보기 -->
+  <dialog id="photo-viewer" class="viewer" aria-label="사진 크게 보기">
+    <img id="viewer-img" alt="">
+    <button type="button" class="viewer-btn viewer-close" data-close aria-label="닫기">✕</button>
+    <button type="button" class="viewer-btn viewer-prev" id="viewer-prev" aria-label="이전 사진">‹</button>
+    <button type="button" class="viewer-btn viewer-next" id="viewer-next" aria-label="다음 사진">›</button>
+    <span class="viewer-count" id="viewer-count"></span>
   </dialog>
 
   <datalist id="region-list"></datalist>

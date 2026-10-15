@@ -60,8 +60,11 @@ const SORTS = {
 };
 const DEFAULT_SORT = { wish: 'recent', visited: 'visitedDate', all: 'recent' };
 
+const MAX_PHOTOS = 10; // 한 장소에 넣을 수 있는 사진 수
+
 const TEXT_FIELDS = ['name', 'category', 'region', 'address', 'googleUrl', 'reason', 'cost', 'costNote',
-  'access', 'notes', 'visitedDate', 'oneLine', 'review', 'actualCost', 'revisit', 'tips'];
+  'access', 'notes', 'visitedDate', 'oneLine', 'review', 'actualCost', 'revisit', 'tips',
+  'summary', 'hours', 'website', 'photoUrl', 'photoPage', 'infoDate'];
 
 /* ---------- 작은 도우미 ---------- */
 const $ = sel => document.querySelector(sel);
@@ -148,6 +151,18 @@ function normalizePlace(raw) {
     actualCost: toNum(raw.actualCost),
     revisit: REVISIT[raw.revisit] ? raw.revisit : '',
     tips: str('tips'),
+    // 장소 정보 (자동으로 채우거나 직접 입력)
+    summary: str('summary'),
+    hours: str('hours'),
+    website: str('website'),
+    photoUrl: safeUrl(str('photoUrl')),
+    photoPage: safeUrl(str('photoPage')),
+    infoDate: /^\d{4}-\d{2}-\d{2}$/.test(str('infoDate')) ? str('infoDate') : '',
+    // 직접 넣은 사진: 사진 파일은 기기(IndexedDB)와 GitHub 비공개 Gist(사진마다 하나)에 따로 있고 여기엔 이름표만
+    photos: (Array.isArray(raw.photos) ? raw.photos : [])
+      .filter(ph => ph && typeof ph.id === 'string' && ph.id)
+      .map(ph => ({ id: ph.id, gist: typeof ph.gist === 'string' ? ph.gist : '' }))
+      .slice(0, MAX_PHOTOS),
     createdAt: str('createdAt') || now,
     updatedAt: str('updatedAt') || now,
   };
@@ -251,6 +266,17 @@ const els = {
   btnClearLoc: $('#btn-clear-loc'),
   geoResults: $('#geo-results'),
   gurlHint: $('#gurl-hint'),
+  btnEnrich: $('#btn-enrich'),
+  enrichStatus: $('#enrich-status'),
+  gmapsSearch: $('#gmaps-search'),
+  photoGrid: $('#photo-grid'),
+  photoInput: $('#photo-input'),
+  photoHint: $('#photo-hint'),
+  viewer: $('#photo-viewer'),
+  viewerImg: $('#viewer-img'),
+  viewerPrev: $('#viewer-prev'),
+  viewerNext: $('#viewer-next'),
+  viewerCount: $('#viewer-count'),
   visitedSection: $('#visited-section'),
   wishDetails: $('#wish-details'),
   settingsDialog: $('#settings-dialog'),
@@ -475,6 +501,7 @@ function setPending(info, { reverse = false, fly = false } = {}) {
     lat: info.lat, lng: info.lng,
     name: info.name || '', address: info.address || '', region: info.region || '',
     googleUrl: info.googleUrl || '',
+    extra: info.extra || null,
     loading: reverse,
   };
   state.pending = pd;
@@ -496,6 +523,7 @@ function setPending(info, { reverse = false, fly = false } = {}) {
         if (!pd.name) pd.name = r.name;
         if (!pd.address) pd.address = r.address;
         if (!pd.region) pd.region = r.region;
+        if (!pd.extra) pd.extra = r.extra;
         // 주소를 찾기 전에 폼을 열었다면 빈 칸만 채워 줌
         if (formSource === pd && els.dialog.open) fillEmptyFields({ name: pd.name, address: pd.address, region: pd.region });
       })
@@ -511,7 +539,8 @@ function clearPending() {
   const m = tempMarker;
   state.pending = null;
   tempMarker = null;
-  if (m) { m.off(); map.removeLayer(m); }
+  // off()로 모든 이벤트를 지우면 Leaflet이 팝업을 닫지 못해 팝업만 남으므로 먼저 닫음
+  if (m) { m.off('popupclose'); m.closePopup(); map.removeLayer(m); }
 }
 
 function pendingPopup(pd) {
@@ -607,7 +636,12 @@ function parseGoogleMaps(text) {
 }
 
 /* ---------- 장소 검색 (OpenStreetMap Nominatim) ---------- */
+// 공용 서버 이용 규칙(초당 1회)을 지키도록 요청 사이에 간격을 둠
+let nominatimNextAt = 0;
 async function nominatim(path, params) {
+  const wait = nominatimNextAt - Date.now();
+  nominatimNextAt = Math.max(Date.now(), nominatimNextAt) + 1100;
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
   const url = new URL(NOMINATIM + path);
   const all = { format: 'jsonv2', addressdetails: 1, 'accept-language': 'ko,ja', ...params };
   Object.entries(all).forEach(([k, v]) => url.searchParams.set(k, v));
@@ -640,18 +674,23 @@ function shortAddress(d) {
 // 지도를 찍었을 때 도로·행정구역 이름이 장소 이름으로 들어가지 않도록
 const NOT_A_PLACE = ['highway', 'boundary', 'landuse', 'place'];
 
+// 영업시간·입장료·위키백과 연결 등 OpenStreetMap에 붙어 있는 추가 정보 (자동 채우기에 씀)
+const osmExtra = d => ({ tags: d.extratags || {}, names: d.namedetails || {}, category: d.category || '', type: d.type || '' });
+
 function fromNominatim(d, { reverse = false } = {}) {
+  const notPlace = reverse && NOT_A_PLACE.includes(d.category);
   return {
     lat: Number(d.lat),
     lng: Number(d.lon),
-    name: reverse && NOT_A_PLACE.includes(d.category) ? '' : (d.name || ''),
+    name: notPlace ? '' : (d.name || ''),
     address: shortAddress(d),
     region: regionFromAddress(d.address),
+    extra: notPlace ? null : osmExtra(d),
   };
 }
 
 async function searchPlaces(q) {
-  const data = await nominatim('/search', { q, countrycodes: 'jp', limit: 8 });
+  const data = await nominatim('/search', { q, countrycodes: 'jp', limit: 8, extratags: 1, namedetails: 1 });
   const out = [];
   for (const r of (Array.isArray(data) ? data : []).map(d => fromNominatim(d))) {
     if (!validLatLng(r.lat, r.lng)) continue;
@@ -663,9 +702,171 @@ async function searchPlaces(q) {
 }
 
 async function reverseGeocode(lat, lng) {
-  const d = await nominatim('/reverse', { lat, lon: lng, zoom: 18 });
+  const d = await nominatim('/reverse', { lat, lon: lng, zoom: 18, extratags: 1, namedetails: 1 });
   if (!d || d.error) throw new Error(d?.error || 'not found');
   return fromNominatim(d, { reverse: true });
+}
+
+/* ---------- 장소 정보 자동 채우기 (무료 공개 자료만) ---------- */
+// OpenStreetMap: 영업시간·입장료·홈페이지·가까운 역 / 위키데이터·위키백과: 사진·소개
+// 입장료 금액이나 '보통 가는 루트'처럼 자료에 없는 건 비워 둠 (직접 적거나 Claude에게 부탁)
+
+async function fetchJson(url, ms = 12000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function distKm(a, b) {
+  const R = 6371;
+  const rad = x => (x * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat);
+  const dLng = rad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const viewbox = (loc, d) => `${loc.lng - d},${loc.lat + d},${loc.lng + d},${loc.lat - d}`;
+
+// 위치 근처에서 이름이 같은 장소를 찾아 추가 정보를 가져옴 (없으면 그 지점의 장소)
+async function lookupOsm(name, loc) {
+  if (name) {
+    const d = await nominatim('/search', {
+      q: name, viewbox: viewbox(loc, 0.01), bounded: 1, countrycodes: 'jp', limit: 1, extratags: 1, namedetails: 1,
+    });
+    if (Array.isArray(d) && d[0]) return osmExtra(d[0]);
+  }
+  const r = await nominatim('/reverse', { lat: loc.lat, lon: loc.lng, zoom: 18, extratags: 1, namedetails: 1 });
+  return r && !r.error && !NOT_A_PLACE.includes(r.category) ? osmExtra(r) : null;
+}
+
+const DAY_KO = { Mo: '월', Tu: '화', We: '수', Th: '목', Fr: '금', Sa: '토', Su: '일', PH: '공휴일' };
+const MONTH_NUM = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
+// OpenStreetMap 영업시간 표기(Mo-Su 07:00-18:00)를 읽기 쉽게
+function hoursKo(oh) {
+  return String(oh || '')
+    .replace(/\b(Mo|Tu|We|Th|Fr|Sa|Su|PH)\b/g, m => DAY_KO[m])
+    .replace(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/g, m => MONTH_NUM[m] + '월')
+    .replace(/\b(off|closed)\b/gi, '휴무')
+    .replace(/^24\/7$/, '24시간')
+    .replace(/\s*;\s*/g, ' / ');
+}
+
+function feeFromTags(t) {
+  for (const k of ['charge:adult', 'charge', 'fee']) {
+    const m = /(\d[\d,]*)\s*(?:JPY|円|yen|¥)?/i.exec(t[k] || '');
+    if (m) return { cost: Number(m[1].replace(/,/g, '')), note: k === 'charge:adult' ? '성인 1인 (자동 입력, 확인 필요)' : '자동 입력, 확인 필요' };
+  }
+  if (/^no$/i.test(t.fee || '')) return { cost: 0, note: '무료 (자동 입력, 확인 필요)' };
+  if (/^yes$/i.test(t.fee || '')) return { cost: null, note: '유료 (금액은 확인 필요)' };
+  return null;
+}
+
+function categoryFromOsm({ category: c, type: t, tags }) {
+  if (c === 'tourism' && ['hotel', 'hostel', 'guest_house', 'motel', 'apartment', 'camp_site', 'chalet'].includes(t)) return 'stay';
+  if (c === 'amenity' && ['restaurant', 'fast_food', 'food_court', 'bar', 'pub'].includes(t)) return 'food';
+  if ((c === 'amenity' && ['cafe', 'ice_cream'].includes(t)) || (c === 'shop' && ['bakery', 'confectionery', 'pastry', 'tea'].includes(t))) return 'cafe';
+  if ((c === 'amenity' && t === 'public_bath') || tags['bath:type'] === 'onsen' || t === 'hot_spring') return 'onsen';
+  if (c === 'shop' || (c === 'amenity' && t === 'marketplace')) return 'shopping';
+  if ((c === 'tourism' && ['theme_park', 'zoo', 'aquarium'].includes(t)) || (c === 'leisure' && ['theme_park', 'water_park'].includes(t))) return 'activity';
+  // 입장료를 받는 공원·정원(겐로쿠엔 등)은 관광지로
+  if (c === 'leisure' && ['park', 'garden'].includes(t) && (/^yes$/i.test(tags.fee || '') || tags.charge || tags['charge:adult'])) return 'sight';
+  if (c === 'natural' || (c === 'leisure' && ['park', 'nature_reserve', 'beach_resort'].includes(t)) || (c === 'boundary' && t === 'national_park')) return 'nature';
+  if (['tourism', 'historic'].includes(c) || (c === 'leisure' && t === 'garden') || (c === 'amenity' && t === 'place_of_worship')) return 'sight';
+  return '';
+}
+
+async function wikiSummary(lang, title) {
+  const d = await fetchJson(`https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`);
+  if (!d || d.type === 'disambiguation' || !d.extract) return null;
+  return {
+    summary: d.extract,
+    photoUrl: d.thumbnail ? String(d.thumbnail.source).split('?')[0] : '',
+    photoPage: (d.content_urls && d.content_urls.desktop && d.content_urls.desktop.page) || '',
+  };
+}
+
+// 위키데이터에 연결된 위키백과 문서: 한국어 → 영어 → 일본어 순
+async function wikiFromWikidata(qid) {
+  const d = await fetchJson(`https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${encodeURIComponent(qid)}&props=sitelinks%7Cclaims&sitefilter=kowiki%7Cenwiki%7Cjawiki&format=json&origin=*`);
+  const e = d.entities && d.entities[qid];
+  if (!e) return null;
+  const site = e.claims && e.claims.P856 && e.claims.P856[0].mainsnak.datavalue;
+  const website = site ? site.value : '';
+  for (const lang of ['ko', 'en', 'ja']) {
+    const link = e.sitelinks && e.sitelinks[lang + 'wiki'];
+    if (!link) continue;
+    const s = await wikiSummary(lang, link.title).catch(() => null);
+    if (s) return { ...s, website };
+  }
+  return website ? { website } : null;
+}
+
+// 위키데이터 연결이 없으면 근처 위키백과 문서 중 이름이 같은 것
+async function wikiNearby(lang, name, loc) {
+  if (!name) return null;
+  const d = await fetchJson(`https://${lang}.wikipedia.org/w/api.php?action=query&list=geosearch&gscoord=${loc.lat}%7C${loc.lng}&gsradius=1000&gslimit=15&format=json&origin=*`);
+  const norm = s => String(s).replace(/[\s·・()（）\-_]/g, '').toLowerCase();
+  const n = norm(name);
+  const hit = ((d.query && d.query.geosearch) || []).find(g => {
+    const t = norm(g.title);
+    return t === n || t.includes(n) || (n.includes(t) && t.length >= n.length - 2);
+  });
+  return hit ? wikiSummary(lang, hit.title) : null;
+}
+
+async function findWiki(name, loc, osm) {
+  if (osm && osm.tags.wikidata) {
+    const w = await wikiFromWikidata(osm.tags.wikidata).catch(() => null);
+    if (w && w.summary) return w;
+  }
+  const ja = osm && (osm.names['name:ja'] || osm.names.name);
+  return (await wikiNearby('ko', name, loc).catch(() => null))
+    || (ja ? await wikiNearby('ja', ja, loc).catch(() => null) : null);
+}
+
+// 가까운 기차역(3km 안)과 버스 정류장(600m 안) — 직선거리
+async function nearbyTransit(loc) {
+  const label = (e, suffix) => {
+    const ko = e.namedetails && e.namedetails['name:ko'];
+    const local = (e.namedetails && e.namedetails.name) || e.name || '';
+    const add = (s, x) => (!x || /역$|駅$|Station$/i.test(s) ? s : s + x);
+    if (ko && ko !== local) return `${add(ko, suffix.ko)}(${add(local, suffix.ja)})`;
+    return add(local, suffix.ja);
+  };
+  const near = (list, ok) => {
+    const seen = new Set();
+    return (Array.isArray(list) ? list : [])
+      .filter(ok)
+      .map(e => ({ e, km: distKm(loc, { lat: Number(e.lat), lng: Number(e.lon) }) }))
+      .sort((a, b) => a.km - b.km)
+      .filter(({ e }) => { const k = (e.namedetails && e.namedetails.name) || e.name; if (seen.has(k)) return false; seen.add(k); return true; });
+  };
+  const common = { bounded: 1, countrycodes: 'jp', limit: 20, namedetails: 1, addressdetails: 0 };
+  const stations = near(
+    await nominatim('/search', { ...common, q: 'station', viewbox: viewbox(loc, 0.03) }),
+    e => (e.category === 'railway' && ['station', 'halt'].includes(e.type)) || (e.category === 'public_transport' && e.type === 'station'),
+  ).slice(0, 3).map(({ e, km }) => ({ name: label(e, { ko: '역', ja: '駅' }), km }));
+  const stops = near(
+    await nominatim('/search', { ...common, q: 'bus stop', viewbox: viewbox(loc, 0.006) }),
+    e => e.category === 'highway' && e.type === 'bus_stop',
+  ).slice(0, 2).map(({ e, km }) => ({ name: label(e, { ko: '', ja: '' }), km }));
+  return { stations, stops };
+}
+
+function distText(km) {
+  return km < 1.5 ? `도보 약 ${Math.max(1, Math.round((km * 1000 * 1.25) / 80))}분` : `약 ${km.toFixed(1)}km`;
+}
+function transitText({ stations, stops }) {
+  const lines = [];
+  if (stations.length) lines.push('가까운 역: ' + stations.map(s => `${s.name} ${distText(s.km)}`).join(', '));
+  if (stops.length) lines.push('가까운 버스 정류장: ' + stops.map(s => `${s.name} ${distText(s.km)}`).join(', '));
+  return lines.length ? lines.join('\n') + '\n(자동 입력 · 직선거리 기준)' : '';
 }
 
 /* ---------- 지도 위 검색창 ---------- */
@@ -796,7 +997,7 @@ function visiblePlaces() {
     .filter(p => state.tab === 'all' || p.status === state.tab)
     .filter(p => !state.region || p.region === state.region)
     .filter(p => !state.category || p.category === state.category)
-    .filter(p => !q || [p.name, p.region, p.address, p.reason, p.access, p.notes, p.costNote, p.oneLine, p.review, p.tips]
+    .filter(p => !q || [p.name, p.region, p.address, p.reason, p.access, p.notes, p.costNote, p.oneLine, p.review, p.tips, p.summary]
       .some(s => (s || '').toLowerCase().includes(q)))
     .sort(sort);
 }
@@ -842,7 +1043,11 @@ function itemHtml(p) {
   const pill = state.tab === 'all'
     ? `<span class="mini-pill ${p.status}">${visited ? '다녀옴' : '가고 싶음'}</span>` : '';
   return `<li><button type="button" class="place-btn" data-id="${esc(p.id)}">
-      <span class="cat-badge ${p.status}" aria-hidden="true">${cat.icon}</span>
+      <span class="cat-badge ${p.status}${p.photos.length || safeUrl(p.photoUrl) ? ' has-photo ph' : ''}" aria-hidden="true">${p.photos.length
+        ? photoImg(p.photos[0])
+        : safeUrl(p.photoUrl)
+          ? `<img src="${esc(p.photoUrl)}" alt="" loading="lazy" onerror="this.replaceWith(document.createTextNode('${cat.icon}'))">`
+          : cat.icon}</span>
       <span class="pi-main">
         <span class="pi-title"><span>${esc(p.name)}</span>${pill}</span>
         <span class="pi-meta">${meta}</span>
@@ -875,6 +1080,7 @@ function emptyHtml() {
 function renderList() {
   const items = visiblePlaces();
   els.list.innerHTML = items.map(itemHtml).join('');
+  hydratePhotos(els.list);
   els.empty.hidden = items.length > 0;
   if (!items.length) els.empty.innerHTML = emptyHtml();
 }
@@ -937,6 +1143,7 @@ function selectPlace(id, { from = 'list' } = {}) {
 function showDetail(p) {
   if (els.detailView.hidden) listScroll = els.panel.scrollTop;
   els.detailView.innerHTML = detailHtml(p);
+  hydratePhotos(els.detailView);
   els.listView.hidden = true;
   els.detailView.hidden = false;
   els.panel.scrollTop = 0;
@@ -999,11 +1206,32 @@ function detailHtml(p) {
   }
 
   const placeRows = [];
+  if (p.hours) placeRows.push(['영업시간', esc(p.hours)]);
+  const site = safeUrl(p.website);
+  if (site) placeRows.push(['홈페이지', `<a href="${esc(site)}" target="_blank" rel="noopener">${esc(site.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, ''))} ↗</a>`]);
   if (p.address) placeRows.push(['주소', esc(p.address)]);
   placeRows.push(['좌표', hasLoc(p) ? `${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}` : '<span class="no-loc">위치 없음 — ‘수정’에서 정할 수 있어요</span>']);
 
+  const photo = safeUrl(p.photoUrl);
+  const credit = safeUrl(p.photoPage);
+  let photoHtml = '';
+  if (p.photos.length) {
+    // 직접 넣은 사진: 첫 장을 크게, 나머지는 아래 작은 사진 (누르면 크게 보기)
+    const [first, ...rest] = p.photos;
+    photoHtml = `<div class="gallery">
+      <button type="button" class="ph g-main loading" data-view="0" aria-label="사진 크게 보기">${photoImg(first, p.name + ' 사진')}</button>
+      ${rest.length ? `<div class="g-thumbs">${rest.map((ph, i) => `<button type="button" class="ph loading" data-view="${i + 1}" aria-label="사진 ${i + 2} 크게 보기">${photoImg(ph)}</button>`).join('')}</div>` : ''}
+    </div>`;
+  } else if (photo) {
+    photoHtml = `<figure class="detail-photo">
+      <img src="${esc(photo)}" alt="${esc(p.name)} 사진" loading="lazy" onerror="this.parentElement.remove()">
+      ${credit ? `<figcaption><a href="${esc(credit)}" target="_blank" rel="noopener">사진·소개: 위키백과 ↗</a></figcaption>` : ''}
+    </figure>`;
+  }
+
   return `<div class="detail">
     <button type="button" class="back" data-act="back">← 목록으로</button>
+    ${photoHtml}
     <div class="detail-hero">
       <div class="cat-badge lg ${p.status}" aria-hidden="true">${cat.icon}</div>
       <div>
@@ -1015,6 +1243,7 @@ function detailHtml(p) {
         <h2>${esc(p.name)}</h2>
       </div>
     </div>
+    ${p.summary ? `<p class="detail-summary">${esc(p.summary)}</p>` : ''}
     <div class="detail-links">
       <a class="btn small" href="${esc(gmapsUrl(p))}" target="_blank" rel="noopener">구글 지도에서 열기 ↗</a>
       <a class="btn small" href="${esc(directionsUrl(p))}" target="_blank" rel="noopener">길찾기 ↗</a>
@@ -1022,7 +1251,7 @@ function detailHtml(p) {
     </div>
     ${visitedCard}
     ${wishCard}
-    <section class="card"><h3>위치</h3>${kv(placeRows)}</section>
+    <section class="card"><h3>장소 정보</h3>${kv(placeRows)}${p.infoDate ? `<p class="info-date">자동 입력 ${fmtDate(p.infoDate)} · OpenStreetMap·위키백과 기준이라 바뀌었을 수 있어요</p>` : ''}</section>
     <div class="detail-actions">
       ${visited ? '' : '<button type="button" class="btn visited" data-act="visit">✓ 다녀왔어요!</button>'}
       <button type="button" class="btn" data-act="edit">수정</button>
@@ -1033,9 +1262,11 @@ function detailHtml(p) {
 }
 
 function deletePlace(id) {
+  const gone = getPlace(id);
   state.places = state.places.filter(p => p.id !== id);
   state.deleted[id] = new Date().toISOString();
   savePlaces();
+  if (gone) forgetPhotos(gone.photos);
   map.closePopup();
   closeDetail();
   renderAll();
@@ -1045,6 +1276,149 @@ function deletePlace(id) {
 /* ---------- 추가·수정 폼 ---------- */
 let formDirty = false;
 let formSource = null; // 폼을 연 임시 핀(주소를 늦게 찾으면 빈 칸을 채우기 위함)
+let formSession = 0;   // 폼을 열 때마다 바뀜 — 늦게 도착한 자동 채우기 결과가 다른 폼에 들어가지 않도록
+let formExtra = null;  // 지금 위치의 OpenStreetMap 추가 정보 (검색 결과에서 고른 경우)
+let catTouched = false;
+let enrichRun = 0;
+let formPhotos = [];          // 폼에서 고치는 중인 사진 목록 [{ id, gist }]
+let formNewPhotos = new Set(); // 이번에 새로 넣은 사진 (저장하지 않고 닫으면 기기에서 지움)
+let formSaved = false;
+
+function setEnrichStatus(text = '', kind = '') {
+  els.enrichStatus.textContent = text;
+  els.enrichStatus.className = 'hint' + (kind ? ' ' + kind : '');
+  els.enrichStatus.hidden = !text;
+}
+
+// 이름(과 위치)으로 구글 지도를 바로 여는 링크 — 찾은 뒤 주소창 링크를 '구글 지도 링크'에 붙여넣으면 위치가 잡힘
+function updateGmapsLink() {
+  const name = els.form.elements.name.value.trim();
+  const loc = state.formLoc;
+  let url = 'https://www.google.com/maps';
+  if (name && loc) url = `https://www.google.com/maps/search/${encodeURIComponent(name)}/@${loc.lat},${loc.lng},15z`;
+  else if (name) url = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(name)}`;
+  else if (loc) url = `https://www.google.com/maps/@${loc.lat},${loc.lng},15z`;
+  els.gmapsSearch.href = url;
+}
+
+// 폼의 사진 칸: 위키백과 사진(자동 채우기로 넣은 것) + 직접 넣은 사진 + 추가 버튼
+function renderFormPhotos() {
+  const f = els.form.elements;
+  const wiki = safeUrl(f.photoUrl.value);
+  const tiles = [];
+  if (wiki) {
+    tiles.push(`<div class="ph"><img src="${esc(wiki)}" alt=""><span class="ph-tag">위키백과</span>
+      <button type="button" class="ph-del" data-del="wiki" aria-label="이 사진 빼기">✕</button></div>`);
+  }
+  formPhotos.forEach((ph, i) => {
+    tiles.push(`<div class="ph loading">${photoImg(ph)}
+      <button type="button" class="ph-del" data-del="${i}" aria-label="이 사진 빼기">✕</button></div>`);
+  });
+  if (formPhotos.length < MAX_PHOTOS) {
+    tiles.push('<button type="button" class="ph-add" data-add><span aria-hidden="true">＋</span>사진 추가</button>');
+  }
+  els.photoGrid.innerHTML = tiles.join('');
+  hydratePhotos(els.photoGrid);
+  els.photoHint.textContent = formPhotos.length
+    ? (sync.cfg ? `${formPhotos.length}장 · 동기화로 다른 기기에서도 보여요` : `${formPhotos.length}장 · 동기화를 켜지 않아 이 기기에만 저장돼요`)
+    : `여행 사진을 ${MAX_PHOTOS}장까지 넣을 수 있어요`;
+}
+
+async function addPhotos(files) {
+  const list = [...files].filter(Boolean);
+  const room = MAX_PHOTOS - formPhotos.length;
+  let failed = 0;
+  for (const file of list.slice(0, room)) {
+    try {
+      const blob = await shrinkPhoto(file);
+      const id = uid();
+      await photoPut({ id, blob, gist: '' });
+      photoUrls.set(id, URL.createObjectURL(blob));
+      formPhotos.push({ id, gist: '' });
+      formNewPhotos.add(id);
+      formDirty = true;
+      renderFormPhotos();
+    } catch {
+      failed++;
+    }
+  }
+  if (failed) toast(`사진 ${failed}장은 넣지 못했어요. JPG·PNG 사진인지 확인해 주세요.`);
+  else if (list.length > room) toast(`사진은 한 곳에 ${MAX_PHOTOS}장까지 넣을 수 있어요`);
+}
+
+// 저장하지 않고 폼을 닫으면 새로 넣었던 사진을 기기에서 지움
+function discardNewPhotos() {
+  for (const id of formNewPhotos) {
+    photoDel(id);
+    const url = photoUrls.get(id);
+    photoUrls.delete(id);
+    if (url) setTimeout(() => URL.revokeObjectURL(url), 3000);
+  }
+  formNewPhotos = new Set();
+}
+
+// 이름·위치로 무료 자료를 찾아 비어 있는 칸만 채움 (적어 둔 내용은 건드리지 않음)
+async function enrichForm({ auto = false } = {}) {
+  const f = els.form.elements;
+  const loc = state.formLoc;
+  const name = f.name.value.trim();
+  if (!loc) {
+    if (!auto) setEnrichStatus('먼저 위치를 정해 주세요. ‘이름으로 찾기’나 ‘지도에서 찍기’를 쓰면 돼요.', 'warn');
+    return;
+  }
+  const run = ++enrichRun;
+  const session = formSession;
+  const current = () => run === enrichRun && session === formSession;
+  els.btnEnrich.disabled = true;
+  setEnrichStatus('✨ 정보를 찾는 중… (몇 초 걸려요)');
+  try {
+    const osm = (formExtra && Object.keys(formExtra.tags).length ? formExtra : null)
+      || await lookupOsm(name, loc).catch(() => null);
+    const tags = (osm && osm.tags) || {};
+    const [wiki, transit] = await Promise.all([
+      findWiki(name, loc, osm).catch(() => null),
+      nearbyTransit(loc).catch(() => null),
+    ]);
+    if (!current()) return;
+
+    const got = [];
+    const missing = [];
+    const fill = (k, v) => {
+      if (!v || !f[k] || f[k].value.trim()) return false;
+      f[k].value = v;
+      return true;
+    };
+    const localName = osm && (osm.names['name:ja'] || osm.names.name);
+    if (fill('googleUrl', `https://www.google.com/maps/search/${encodeURIComponent(localName || name)}/@${loc.lat},${loc.lng},17z`)) got.push('구글 지도 링크');
+    if (!els.form.dataset.id && !catTouched && osm) {
+      const c = categoryFromOsm(osm);
+      if (c) f.category.value = c;
+    }
+    if (wiki && wiki.photoUrl && fill('photoUrl', wiki.photoUrl)) { f.photoPage.value = wiki.photoPage || ''; got.push('사진'); }
+    if (wiki && fill('summary', wiki.summary)) got.push('소개');
+    else if (!f.summary.value.trim()) missing.push('소개');
+    if (fill('website', tags.website || tags['contact:website'] || (wiki && wiki.website))) got.push('홈페이지');
+    if (fill('hours', hoursKo(tags.opening_hours))) got.push('영업시간');
+    else if (!f.hours.value.trim()) missing.push('영업시간');
+    const fee = feeFromTags(tags);
+    if (fee && !f.cost.value.trim() && !f.costNote.value.trim()) {
+      if (fee.cost !== null) f.cost.value = fee.cost;
+      f.costNote.value = fee.note;
+      got.push(fee.cost !== null ? '입장료' : '유료 여부');
+    } else if (!f.cost.value.trim() && ['sight', 'nature', 'onsen', 'activity'].includes(f.category.value)) missing.push('입장료');
+    if (transit && fill('access', transitText(transit))) got.push('가까운 역');
+
+    if (got.length) { f.infoDate.value = today(); formDirty = true; }
+    renderFormPhotos();
+    const msg = (got.length ? `✨ 채운 정보: ${got.join(', ')}` : '새로 채울 정보를 찾지 못했어요')
+      + (missing.length ? ` · 못 찾은 정보: ${missing.join(', ')} (직접 적거나 Claude에게 부탁해 주세요)` : '');
+    setEnrichStatus(msg, got.length ? 'ok' : 'warn');
+  } catch {
+    if (current()) setEnrichStatus('정보를 가져오지 못했어요. 인터넷 연결을 확인하고 다시 눌러 주세요.', 'warn');
+  } finally {
+    if (run === enrichRun) els.btnEnrich.disabled = false;
+  }
+}
 
 function buildRating(container) {
   const name = container.dataset.name;
@@ -1113,7 +1487,10 @@ function fillEmptyFields(values) {
 function openForm(place, overrides = {}, { source = null } = {}) {
   const f = els.form;
   if (state.picking) stopPicking();
-  if (els.dialog.open) els.dialog.close();
+  if (els.dialog.open) {
+    if (!formSaved) discardNewPhotos();
+    els.dialog.close();
+  }
   f.reset();
   const d = { ...(place || { status: tabStatus(), category: 'sight' }), ...overrides };
   f.dataset.id = place ? place.id : '';
@@ -1134,8 +1511,17 @@ function openForm(place, overrides = {}, { source = null } = {}) {
   setGurlHint();
   els.geoResults.hidden = true;
   updateFormSections();
+  setEnrichStatus();
   formDirty = false;
+  formSaved = false;
   formSource = source;
+  formSession++;
+  formExtra = (source && source.extra) || null;
+  catTouched = false;
+  formPhotos = place ? place.photos.map(ph => ({ ...ph })) : [];
+  formNewPhotos = new Set();
+  renderFormPhotos();
+  updateGmapsLink();
 
   els.dialog.showModal();
   els.dialog.querySelector('.sheet-body').scrollTop = 0;
@@ -1147,6 +1533,7 @@ function openForm(place, overrides = {}, { source = null } = {}) {
 function requestClose(dlg) {
   if (dlg === els.dialog && formDirty && !confirm('작성 중인 내용이 저장되지 않았어요. 닫을까요?')) return;
   dlg.close();
+  if (dlg === els.dialog && !formSaved) discardNewPhotos(); // 저장 안 하고 닫으면 새로 넣은 사진 정리
 }
 
 // 위치를 새로 정하면 주소·지역은 새 위치 기준으로 바꾸고, 이름은 비어 있을 때만 채움
@@ -1168,10 +1555,12 @@ async function fillAddressFromLoc() {
 
 function setFormLoc(lat, lng, info) {
   state.formLoc = { lat, lng };
+  formExtra = (info && info.extra) || null;
   formDirty = true;
   updateLocText();
   if (info) applyLocInfo(info);
   else fillAddressFromLoc();
+  updateGmapsLink();
 }
 
 function handleFormGoogleUrl() {
@@ -1212,7 +1601,7 @@ async function formGeocode() {
       b.className = 'result';
       b.innerHTML = `<strong>${esc(r.name || '이름 없는 장소')}</strong><span>${esc(r.address)}</span>`;
       b.addEventListener('click', () => {
-        setFormLoc(r.lat, r.lng, { address: r.address, region: r.region });
+        setFormLoc(r.lat, r.lng, { address: r.address, region: r.region, extra: r.extra });
         ul.hidden = true;
       });
       li.append(b);
@@ -1271,6 +1660,7 @@ function submitForm(e) {
     region: regionFromText(fields.region),
     lat: state.formLoc ? state.formLoc.lat : null,
     lng: state.formLoc ? state.formLoc.lng : null,
+    photos: formPhotos,
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now,
   });
@@ -1278,6 +1668,10 @@ function submitForm(e) {
   if (existing) state.places[state.places.indexOf(existing)] = place;
   else state.places.push(place);
   savePlaces();
+  // 폼에서 뺀 사진은 기기·GitHub에서 지움
+  if (existing) forgetPhotos(existing.photos.filter(ph => !place.photos.some(x => x.id === ph.id)));
+  formNewPhotos = new Set();
+  formSaved = true;
 
   formDirty = false;
   formSource = null;
@@ -1368,6 +1762,235 @@ async function importData(file) {
   }
 }
 
+/* ---------- 사진 (직접 넣은 사진) ---------- */
+// 사진 파일은 이 기기 IndexedDB에 먼저 저장해서 인터넷이 없어도 넣고 볼 수 있음.
+// 동기화를 켜 두면 사진마다 비공개 Gist를 하나씩 만들어 올림 — 기록 파일(Gist)이 무거워지지 않고,
+// 다른 기기는 그 사진을 볼 때 한 번만 내려받아 저장해 둠.
+const PHOTO_DB = 'jp-travel-photos';
+const PHOTO_TRASH_KEY = 'jp-travel-photo-trash-v1'; // 지울 사진 Gist (인터넷 될 때 지움)
+const PHOTO_MAX_SIDE = 1280;
+const PHOTO_GIST_DESC = '일본 여행 기록장 사진';
+
+let photoDbPromise = null;
+function photoDb() {
+  if (!photoDbPromise) {
+    photoDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(PHOTO_DB, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('photos', { keyPath: 'id' });
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return photoDbPromise;
+}
+async function photoStore(mode, fn) {
+  const db = await photoDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('photos', mode);
+    const req = fn(tx.objectStore('photos'));
+    tx.oncomplete = () => resolve(req ? req.result : undefined);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+const photoGet = id => photoStore('readonly', s => s.get(id)).catch(() => null);
+const photoPut = rec => photoStore('readwrite', s => s.put(rec));
+const photoDel = id => photoStore('readwrite', s => s.delete(id)).catch(() => {});
+
+function loadPhotoTrash() {
+  try {
+    const a = JSON.parse(localStorage.getItem(PHOTO_TRASH_KEY) || '[]');
+    return new Set(Array.isArray(a) ? a.filter(x => typeof x === 'string' && x) : []);
+  } catch {
+    return new Set();
+  }
+}
+const photoTrash = loadPhotoTrash();
+function savePhotoTrash() {
+  try { localStorage.setItem(PHOTO_TRASH_KEY, JSON.stringify([...photoTrash])); } catch { /* 무시 */ }
+}
+
+// 사진에서 빠진 것들: 기기에서 지우고, GitHub에 올라간 사진은 지울 목록에 넣음
+function forgetPhotos(list) {
+  for (const ph of list) {
+    photoDel(ph.id);
+    const url = photoUrls.get(ph.id);
+    photoUrls.delete(ph.id);
+    if (url) setTimeout(() => URL.revokeObjectURL(url), 3000); // 화면이 새로 그려진 뒤에 정리
+    if (ph.gist) photoTrash.add(ph.gist);
+  }
+  savePhotoTrash();
+  processPhotoQueue();
+}
+
+// 휴대폰 사진은 크기가 커서 긴 변 1280px JPEG로 줄여 저장 (보통 200~400KB)
+async function shrinkPhoto(file) {
+  const bmp = await createImageBitmap(file);
+  const scale = Math.min(1, PHOTO_MAX_SIDE / Math.max(bmp.width, bmp.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bmp.width * scale);
+  canvas.height = Math.round(bmp.height * scale);
+  canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  if (bmp.close) bmp.close();
+  const toJpeg = q => new Promise((resolve, reject) => canvas.toBlob(b => (b ? resolve(b) : reject(new Error('encode'))), 'image/jpeg', q));
+  let blob = await toJpeg(0.82);
+  if (blob.size > 500000) blob = await toJpeg(0.68);
+  return blob;
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1] || '');
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+async function downloadPhoto(gistId) {
+  const { data } = await github('/gists/' + gistId, sync.cfg.token);
+  const file = data && data.files && Object.values(data.files)[0];
+  if (!file) return null;
+  let b64 = file.content || '';
+  if (file.truncated) b64 = await (await fetch(file.raw_url)).text();
+  return (await fetch('data:image/jpeg;base64,' + b64.trim())).blob();
+}
+
+// 사진 id → 화면에 쓸 주소 (기기에 없으면 GitHub에서 한 번 받아 저장)
+const photoUrls = new Map();
+const photoLoads = new Map();
+function photoSrc(ph) {
+  if (photoUrls.has(ph.id)) return Promise.resolve(photoUrls.get(ph.id));
+  if (photoLoads.has(ph.id)) return photoLoads.get(ph.id);
+  const job = (async () => {
+    let rec = await photoGet(ph.id);
+    if (!rec && ph.gist && sync.cfg && navigator.onLine !== false) {
+      const blob = await downloadPhoto(ph.gist).catch(() => null);
+      if (blob) {
+        rec = { id: ph.id, blob, gist: ph.gist };
+        photoPut(rec).catch(() => {});
+      }
+    }
+    if (!rec) return null;
+    const url = URL.createObjectURL(rec.blob);
+    photoUrls.set(ph.id, url);
+    return url;
+  })().finally(() => photoLoads.delete(ph.id));
+  photoLoads.set(ph.id, job);
+  return job;
+}
+
+// 그려 둔 <img data-photo> 들에 실제 사진을 채움
+function hydratePhotos(root) {
+  root.querySelectorAll('img[data-photo]').forEach(async img => {
+    const box = img.closest('.ph');
+    const url = await photoSrc({ id: img.dataset.photo, gist: img.dataset.gist || '' });
+    if (url) {
+      img.src = url;
+      if (box) box.classList.remove('loading');
+    } else if (box) {
+      box.classList.remove('loading');
+      box.classList.add('missing');
+    }
+  });
+}
+const photoImg = (ph, alt = '') =>
+  `<img data-photo="${esc(ph.id)}" data-gist="${esc(ph.gist)}" alt="${esc(alt)}">`;
+
+// 아직 안 올린 사진 올리기 + 지운 사진 Gist 지우기 (동기화를 켜 둔 경우만)
+const photoQueue = { running: false, again: false };
+async function processPhotoQueue() {
+  const cfg = sync.cfg;
+  if (!cfg || navigator.onLine === false) return;
+  if (photoQueue.running) { photoQueue.again = true; return; }
+  photoQueue.running = true;
+  let changed = false;
+  try {
+    for (const gid of [...photoTrash]) {
+      try {
+        await github('/gists/' + gid, cfg.token, { method: 'DELETE' });
+      } catch (e) {
+        if (e.code !== 'notfound') throw e;
+      }
+      photoTrash.delete(gid);
+      savePhotoTrash();
+    }
+    for (const p of [...state.places]) {
+      for (const ph of p.photos) {
+        if (ph.gist || sync.cfg !== cfg) continue;
+        const rec = await photoGet(ph.id);
+        if (!rec) continue; // 다른 기기에서 넣고 아직 안 올린 사진
+        const content = await blobToBase64(rec.blob);
+        const { data } = await github('/gists', cfg.token, {
+          method: 'POST',
+          body: {
+            description: `${PHOTO_GIST_DESC} — ${p.name} (지우지 마세요)`,
+            public: false,
+            files: { [`photo-${ph.id}.jpg.base64.txt`]: { content } },
+          },
+        });
+        rec.gist = data.id;
+        await photoPut(rec).catch(() => {});
+        // 올리는 사이 기록이 바뀌었을 수 있으니 지금 기록에서 다시 찾음
+        const cur = getPlace(p.id);
+        const target = cur && cur.photos.find(x => x.id === ph.id);
+        if (target && !target.gist) {
+          target.gist = data.id;
+          cur.updatedAt = new Date().toISOString();
+          changed = true;
+        } else {
+          photoTrash.add(data.id); // 그새 사진을 뺐으면 방금 올린 것도 지움
+          savePhotoTrash();
+        }
+      }
+    }
+  } catch {
+    /* 인터넷·GitHub 문제면 다음 동기화 때 다시 시도 */
+  } finally {
+    photoQueue.running = false;
+    if (changed) savePlaces();
+    if (photoQueue.again) {
+      photoQueue.again = false;
+      processPhotoQueue();
+    }
+  }
+}
+
+// 어느 장소에도 없는 사진 중 GitHub에 올라간 것만 기기에서 정리 (안 올린 사진은 절대 지우지 않음)
+async function prunePhotoCache() {
+  try {
+    const used = new Set(state.places.flatMap(p => p.photos.map(ph => ph.id)));
+    if (els.dialog.open) formPhotos.forEach(ph => used.add(ph.id)); // 고치는 중인 폼의 사진은 남김
+    const all = await photoStore('readonly', s => s.getAll());
+    for (const rec of all || []) {
+      if (!used.has(rec.id) && rec.gist) photoDel(rec.id);
+    }
+  } catch { /* 무시 */ }
+}
+
+/* 사진 크게 보기 */
+const viewer = { list: [], index: 0 };
+function openViewer(list, index) {
+  viewer.list = list;
+  viewer.index = index;
+  showViewerPhoto();
+  if (!els.viewer.open) els.viewer.showModal();
+}
+async function showViewerPhoto() {
+  const { list, index } = viewer;
+  const item = list[index];
+  els.viewerCount.textContent = list.length > 1 ? `${index + 1} / ${list.length}` : '';
+  els.viewerPrev.hidden = els.viewerNext.hidden = list.length < 2;
+  els.viewerImg.removeAttribute('src');
+  const url = item.url || await photoSrc(item);
+  if (viewer.list === list && viewer.index === index && url) els.viewerImg.src = url;
+}
+function stepViewer(d) {
+  if (viewer.list.length < 2) return;
+  viewer.index = (viewer.index + d + viewer.list.length) % viewer.list.length;
+  showViewerPhoto();
+}
+
 /* ---------- 기기 간 동기화 (GitHub Gist) ---------- */
 // 기록 전체를 내 GitHub 계정의 비공개 Gist 파일 하나에 보관함.
 // 동기화할 때마다 받아와서 장소별로 더 나중에 고친 쪽을 남기고(지운 기록 포함) 바뀐 게 있으면 다시 올림.
@@ -1445,7 +2068,7 @@ async function github(path, token, { method = 'GET', body } = {}) {
     if (res.status === 403 || res.status === 429) throw new SyncError('limit', res.status);
     if (res.status === 404) throw new SyncError('notfound', 404);
     if (!res.ok) throw new SyncError('server', res.status);
-    return { data: await res.json(), headers: res.headers };
+    return { data: res.status === 204 ? null : await res.json(), headers: res.headers }; // 204: 지우기 성공(내용 없음)
   } catch (e) {
     throw e instanceof SyncError ? e : new SyncError('offline');
   } finally {
@@ -1603,6 +2226,7 @@ async function syncNow() {
     saveSyncConfig();
     sync.lastToast = '';
     setSyncState('ok');
+    processPhotoQueue(); // 기록을 맞춘 뒤 사진 올리기·지우기
   } catch (e) {
     if (sync.cfg !== cfg) return;
     const code = SYNC_MESSAGES[e.code] ? e.code : 'server';
@@ -1637,7 +2261,7 @@ async function connectSync(rawToken) {
     sync.cfg = { token, gistId, login: user.login || '', lastSyncAt: created ? new Date().toISOString() : '' };
     saveSyncConfig();
     els.syncToken.value = '';
-    if (created) setSyncState('ok'); else await syncNow();
+    if (created) { setSyncState('ok'); processPhotoQueue(); } else await syncNow();
     if (sync.state === 'ok') {
       toast(created
         ? `동기화를 켰어요 · 이 기기의 ${state.places.length}곳을 GitHub에 올렸어요`
@@ -1735,8 +2359,10 @@ function init() {
 
   // 상세 보기 버튼
   els.detailView.addEventListener('click', e => {
-    const btn = e.target.closest('[data-act]');
     const p = getPlace(state.selectedId);
+    const shot = e.target.closest('[data-view]');
+    if (shot && p) { openViewer(p.photos, Number(shot.dataset.view)); return; }
+    const btn = e.target.closest('[data-act]');
     if (!btn || !p) return;
     switch (btn.dataset.act) {
       case 'back': closeDetail(); map.closePopup(); break;
@@ -1760,7 +2386,45 @@ function init() {
   els.form.elements.googleUrl.addEventListener('paste', () => setTimeout(handleFormGoogleUrl, 0));
   els.btnPick.addEventListener('click', startPick);
   els.btnGeocode.addEventListener('click', formGeocode);
-  els.btnClearLoc.addEventListener('click', () => { state.formLoc = null; formDirty = true; updateLocText(); });
+  els.btnClearLoc.addEventListener('click', () => { state.formLoc = null; formExtra = null; formDirty = true; updateLocText(); });
+  els.btnEnrich.addEventListener('click', () => enrichForm());
+  els.form.elements.category.addEventListener('change', () => { catTouched = true; });
+  els.form.elements.name.addEventListener('input', updateGmapsLink);
+
+  // 사진 칸: 추가 버튼 → 파일 고르기(휴대폰은 카메라·앨범), ✕ → 빼기, 사진 누르면 크게 보기
+  els.photoGrid.addEventListener('click', e => {
+    if (e.target.closest('[data-add]')) { els.photoInput.click(); return; }
+    const del = e.target.closest('[data-del]');
+    if (del) {
+      if (del.dataset.del === 'wiki') {
+        els.form.elements.photoUrl.value = '';
+        els.form.elements.photoPage.value = '';
+      } else {
+        const [ph] = formPhotos.splice(Number(del.dataset.del), 1);
+        if (ph && formNewPhotos.has(ph.id)) { formNewPhotos.delete(ph.id); photoDel(ph.id); }
+      }
+      formDirty = true;
+      renderFormPhotos();
+      return;
+    }
+    const tile = e.target.closest('.ph');
+    if (tile) {
+      const i = [...els.photoGrid.querySelectorAll('.ph img[data-photo]')].indexOf(tile.querySelector('img[data-photo]'));
+      if (i >= 0) openViewer(formPhotos, i);
+    }
+  });
+  els.photoInput.addEventListener('change', async () => {
+    const files = [...els.photoInput.files];
+    els.photoInput.value = '';
+    if (files.length) await addPhotos(files);
+  });
+  // 사진 크게 보기
+  els.viewerPrev.addEventListener('click', () => stepViewer(-1));
+  els.viewerNext.addEventListener('click', () => stepViewer(1));
+  els.viewer.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft') stepViewer(-1);
+    if (e.key === 'ArrowRight') stepViewer(1);
+  });
   $('#btn-pick-cancel').addEventListener('click', () => endPick(null));
 
   // 대화상자 공통: 닫기 버튼, Esc, 바깥 클릭
@@ -1768,7 +2432,7 @@ function init() {
     const c = e.target.closest('[data-close]');
     if (c) requestClose(c.closest('dialog'));
   });
-  for (const dlg of [els.dialog, els.settingsDialog, els.helpDialog]) {
+  for (const dlg of [els.dialog, els.settingsDialog, els.helpDialog, els.viewer]) {
     dlg.addEventListener('cancel', e => { e.preventDefault(); requestClose(dlg); });
     if (dlg === els.dialog) continue; // 입력 폼은 바깥 클릭으로 닫지 않음
     let downOnBackdrop = false;
@@ -1845,6 +2509,7 @@ function init() {
   fitToVisible({ animate: false });
   renderSyncStatus();
   if (sync.cfg) syncNow();
+  setTimeout(prunePhotoCache, 8000); // 다른 기기에서 지운 사진의 저장본 정리
 }
 
 init();
