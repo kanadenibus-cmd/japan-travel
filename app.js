@@ -1219,8 +1219,8 @@ function detailHtml(p) {
     // 직접 넣은 사진: 첫 장을 크게, 나머지는 아래 작은 사진 (누르면 크게 보기)
     const [first, ...rest] = p.photos;
     photoHtml = `<div class="gallery">
-      <button type="button" class="ph g-main loading" data-view="0" aria-label="사진 크게 보기">${photoImg(first, p.name + ' 사진')}</button>
-      ${rest.length ? `<div class="g-thumbs">${rest.map((ph, i) => `<button type="button" class="ph loading" data-view="${i + 1}" aria-label="사진 ${i + 2} 크게 보기">${photoImg(ph)}</button>`).join('')}</div>` : ''}
+      <button type="button" class="ph g-main loading" data-shot="0" aria-label="사진 크게 보기">${photoImg(first, p.name + ' 사진')}</button>
+      ${rest.length ? `<div class="g-thumbs">${rest.map((ph, i) => `<button type="button" class="ph loading" data-shot="${i + 1}" aria-label="사진 ${i + 2} 크게 보기">${photoImg(ph)}</button>`).join('')}</div>` : ''}
     </div>`;
   } else if (photo) {
     photoHtml = `<figure class="detail-photo">
@@ -1971,6 +1971,7 @@ async function prunePhotoCache() {
 /* 사진 크게 보기 */
 const viewer = { list: [], index: 0 };
 function openViewer(list, index) {
+  if (!list.length || !Number.isInteger(index) || index < 0 || index >= list.length) return; // 볼 사진이 없으면 열지 않음
   viewer.list = list;
   viewer.index = index;
   showViewerPhoto();
@@ -2360,8 +2361,9 @@ function init() {
   // 상세 보기 버튼
   els.detailView.addEventListener('click', e => {
     const p = getPlace(state.selectedId);
-    const shot = e.target.closest('[data-view]');
-    if (shot && p) { openViewer(p.photos, Number(shot.dataset.view)); return; }
+    // 사진 버튼만 (data-view는 화면 전체 <main>에도 있어서 쓰면 안 됨 — 모든 버튼이 사진 보기로 열렸던 버그)
+    const shot = e.target.closest('[data-shot]');
+    if (shot && p) { openViewer(p.photos, Number(shot.dataset.shot)); return; }
     const btn = e.target.closest('[data-act]');
     if (!btn || !p) return;
     switch (btn.dataset.act) {
